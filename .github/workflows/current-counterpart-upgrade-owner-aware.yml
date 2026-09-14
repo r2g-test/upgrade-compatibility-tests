@@ -1,0 +1,87 @@
+name: Current counterpart upgrade surface (owner aware)
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  counterpart-upgrade:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.TEST_FLEET_GITHUB_TOKEN || github.token }}
+      PYTHONPATH: ${{ github.workspace }}/src
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Run deterministic local upgrade suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -v
+          if [[ -f scripts/verify_repository.py ]]; then python3 scripts/verify_repository.py; fi
+
+      - name: Discover production owner repositories without assuming owner kind
+        id: repos
+        shell: bash
+        run: |
+          set -euo pipefail
+          p="${GITHUB_REPOSITORY_OWNER%-test}"
+          if gh api --paginate "/orgs/$p/repos?type=all&per_page=100" --jq '.[] | select(.archived|not) | [.name,.default_branch] | @tsv' >/tmp/repos 2>/tmp/org.err; then
+            kind=organization
+          else
+            gh api --paginate "/users/$p/repos?type=all&per_page=100" --jq '.[] | select(.archived|not) | [.name,.default_branch] | @tsv' >/tmp/repos
+            kind=user
+          fi
+          test -s /tmp/repos || { echo "No production repositories visible for $p" >&2; exit 1; }
+          printf 'owner_kind=%s\n' "$kind" >> "$GITHUB_OUTPUT"
+          printf 'repo_count=%s\n' "$(wc -l </tmp/repos | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          echo "owner=$p kind=$kind repos=$(wc -l </tmp/repos)"
+
+      - name: Verify at least one exact current production contract or build authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          p="${GITHUB_REPOSITORY_OWNER%-test}"
+          seen=0
+          scanned=0
+          while IFS=$'\t' read -r r branch; do
+            [[ -n "$r" && -n "$branch" ]] || continue
+            sha="$(gh api "/repos/$p/$r/commits/$branch" --jq .sha 2>/dev/null || true)"
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "skip unreachable candidate $p/$r@$branch"; continue; }
+            scanned=$((scanned + 1))
+            marker=0
+            for root in .zpkg.toml Cargo.toml package.json pyproject.toml go.mod pubspec.yaml; do
+              if gh api "/repos/$p/$r/contents/$root?ref=$sha" >/dev/null 2>&1; then marker=1; break; fi
+            done
+            paths="$(gh api "/repos/$p/$r/git/trees/$sha?recursive=1" --jq '.tree[]?.path' 2>/dev/null || true)"
+            if ((marker==1)) || grep -Eiq '(\.tsp$|\.proto$|\.wit$|(^|/)openapi[^/]*\.(json|ya?ml)$|(^|/)[^/]*schema[^/]*\.json$)' <<<"$paths"; then
+              echo "authority/build candidate: $p/$r@$sha"
+              seen=$((seen + 1))
+            fi
+          done </tmp/repos
+          ((scanned > 0)) || { echo "No reachable production repositories for $p" >&2; exit 1; }
+          ((seen > 0)) || { echo "No current contract/build authority found across $scanned reachable repositories" >&2; exit 1; }
+
+      - name: Record counterpart discovery evidence
+        shell: bash
+        run: |
+          {
+            echo '### Counterpart discovery'
+            echo "- owner: \`${GITHUB_REPOSITORY_OWNER%-test}\`"
+            echo "- owner kind: \`${{ steps.repos.outputs.owner_kind }}\`"
+            echo "- visible repositories: ${{ steps.repos.outputs.repo_count }}"
+            echo '- individual inaccessible candidates are skipped, but zero reachable authorities fails closed'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: zed-pkg compatibility canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .deps/zed-interfaces
+          git clone --depth 1 https://github.com/zed-pkg/zed-interfaces.git .deps/zed-interfaces
+          test -e .deps/zed-interfaces/Cargo.toml || test -e .deps/zed-interfaces/package.json || test -e .deps/zed-interfaces/pubspec.yaml
